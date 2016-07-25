@@ -15,7 +15,7 @@ import (
 	"golang.org/x/net/html"
 )
 
-type CrawlTask struct {
+type FoundLink struct {
 	url    *urllib.URL
 	parent string
 }
@@ -29,7 +29,7 @@ func findAttr(token html.Token, key string) (string, error) {
 	return "", errors.New("No " + key + " attribute found")
 }
 
-func parseHTML(htmlReader io.Reader, base *urllib.URL, taskChan chan <- CrawlTask, legalHashLinksChan chan <- string, tasks *sync.WaitGroup) {
+func parseHTML(htmlReader io.Reader, base *urllib.URL, taskChan chan <- FoundLink, legalHashLinksChan chan <- string, tasks *sync.WaitGroup) {
 	tokenizer := html.NewTokenizer(htmlReader)
 
 	for {
@@ -64,7 +64,7 @@ func parseHTML(htmlReader io.Reader, base *urllib.URL, taskChan chan <- CrawlTas
 						resolvedURL := base.ResolveReference(hrefURL)
 
 						tasks.Add(1)
-						taskChan <- CrawlTask{resolvedURL, base.String()}
+						taskChan <- FoundLink{resolvedURL, base.String()}
 					}
 				}
 
@@ -81,26 +81,28 @@ func parseHTML(htmlReader io.Reader, base *urllib.URL, taskChan chan <- CrawlTas
 	}
 }
 
-func crawl(task CrawlTask, taskChan chan <- CrawlTask, legalHashLinksChan chan <- string, tasks *sync.WaitGroup) {
+func crawl(task FoundLink, goDeeper bool, taskChan chan <- FoundLink, legalHashLinksChan chan <- string, tasks *sync.WaitGroup) {
 	defer tasks.Done()
 
 	url := task.url
 	//log.Printf("Crawling %s\n", url.String())
 	resp, err := http.Get(url.String())
 	if err != nil {
-		log.Printf("Failed to GET %s: %s\n", url.String(), err.Error())
+		log.Printf("Failed to GET %s on %s: %s\n", url.String(), task.parent, err.Error())
 		return
 	}
 
 	if resp.StatusCode != 200 {
-		log.Printf("Dead link %s on %s\n", url.String(), task.parent)
+		log.Printf("Dead link (%d) %s on %s\n", resp.StatusCode, url.String(), task.parent)
 		return
 	}
 
-	htmlReader := resp.Body
-	defer htmlReader.Close()
+	if goDeeper {
+		htmlReader := resp.Body
+		defer htmlReader.Close()
 
-	parseHTML(htmlReader, resp.Request.URL, taskChan, legalHashLinksChan, tasks)
+		parseHTML(htmlReader, resp.Request.URL, taskChan, legalHashLinksChan, tasks)
+	}
 }
 
 func isDescendant(url string, seedURLs []string) bool {
@@ -120,7 +122,7 @@ func extractPage(url *urllib.URL) *urllib.URL {
 	return parsedURL
 }
 
-func eventLoop(taskChan <-chan CrawlTask, process func(CrawlTask), finishedChan chan <- bool) {
+func eventLoop(taskChan <-chan FoundLink, process func(FoundLink), finishedChan chan <- bool) {
 	for task := range taskChan {
 		//log.Println("processing")
 		process(task)
@@ -156,30 +158,40 @@ func main() {
 	finishedHashLinksChan := make(chan map[string]bool)
 	go acceptLegalHashLinks(legalHashLinkChan, finishedHashLinksChan)
 
-	taskChan := make(chan CrawlTask)
+	taskChan := make(chan FoundLink)
 	var tasks sync.WaitGroup
 
+	isValidURL := func(url string) bool {
+		return (strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")) &&
+				!strings.Contains(url, "_history") && !strings.Contains(url, "rbcommons")
+	}
+
 	isCrawlableURL := func(url string) bool {
-		return isDescendant(url, seedURLs) && !strings.Contains(url, "_history")
+		return isDescendant(url, seedURLs)
 	}
 
 	visitedPages := make(map[string]bool)
-	hashLinks := make(map[CrawlTask]bool)
+	hashLinks := make(map[FoundLink]bool)
 	ignoredURLs := make(map[string]bool)
 
-	process := func(task CrawlTask) {
+	process := func(task FoundLink) {
 		url := task.url
 		urlString := url.String()
-		if isCrawlableURL(urlString) {
-			if url.Fragment != "" && url.Fragment != "start-of-content" {
-				hashLinks[task] = true
+
+		if isValidURL(urlString) {
+			isCrawlable := isCrawlableURL(urlString)
+			if isCrawlable {
+				if url.Fragment != "" && url.Fragment != "start-of-content" {
+					hashLinks[task] = true
+				}
 			}
+
 			pageURL := extractPage(url)
 			pageURLString := pageURL.String()
 			if !visitedPages[pageURLString] {
 				visitedPages[pageURLString] = true
 				time.Sleep(100 * time.Millisecond)
-				go crawl(task, taskChan, legalHashLinkChan, &tasks)
+				go crawl(task, isCrawlable, taskChan, legalHashLinkChan, &tasks)
 			} else {
 				tasks.Done()
 			}
@@ -201,7 +213,7 @@ func main() {
 		}
 
 		tasks.Add(1)
-		taskChan <- CrawlTask{parsedURL, ""}
+		taskChan <- FoundLink{parsedURL, ""}
 	}
 	log.Println("Submitted")
 
